@@ -225,8 +225,22 @@ let chunks = [], chunkLen = 0, recStart = 0, peakHold = 0;
 
 const WORKLET = `class C extends AudioWorkletProcessor{process(i){const c=i[0]&&i[0][0];if(c)this.port.postMessage(c.slice(0));return true}}registerProcessor("cap",C);`;
 
+function audioAlive(){
+  if(!ctx || !stream) return false;
+  const tr = stream.getAudioTracks()[0];
+  return !!tr && tr.readyState === "live" && !tr.muted && ctx.state !== "closed";
+}
+function teardownAudio(){
+  try{ if(stream) stream.getTracks().forEach(t => t.stop()); }catch(e){}
+  try{ if(ctx && ctx.state !== "closed") ctx.close(); }catch(e){}
+  ctx = null; stream = null; src = null; node = null; analyser = null;
+}
 async function ensureAudio(){
-  if(ctx && stream) { if(ctx.state==="suspended") await ctx.resume(); return; }
+  if(audioAlive()){
+    if(ctx.state !== "running"){ try{ await ctx.resume(); }catch(e){} }
+    if(ctx.state === "running") return;
+  }
+  teardownAudio();
   if(!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia)
     throw new Error("Dieser Browser erlaubt hier keinen Mikrofonzugriff (HTTPS nötig).");
   stream = await navigator.mediaDevices.getUserMedia({audio:{
@@ -247,16 +261,20 @@ async function ensureAudio(){
   }
   const mute = ctx.createGain(); mute.gain.value = 0;
   src.connect(node); node.connect(mute); mute.connect(ctx.destination);
-  drawMeter();
+  const tr = stream.getAudioTracks()[0];
+  if(tr) tr.addEventListener("ended", () => { if(recording) abortRec("Mikrofon wurde unterbrochen – bitte nochmal aufnehmen."); teardownAudio(); });
+  if(!meterRunning) drawMeter();
 }
 
+let meterRunning = false;
 function drawMeter(){
-  const cv = $("meter"), g = cv.getContext("2d"), data = new Float32Array(analyser.fftSize);
+  meterRunning = true;
+  const cv = $("meter"), g = cv.getContext("2d"), data = new Float32Array(2048);
   const ink = getComputedStyle(document.documentElement).getPropertyValue("--meter").trim() || "#000";
   const loop = () => {
     const w = cv.clientWidth * 2; if(cv.width !== w) cv.width = w;
-    analyser.getFloatTimeDomainData(data);
-    let pk = 0; for(let i=0;i<data.length;i++){ const a = Math.abs(data[i]); if(a>pk) pk=a; }
+    let pk = 0;
+    if(analyser){ analyser.getFloatTimeDomainData(data); for(let i=0;i<data.length;i++){ const a = Math.abs(data[i]); if(a>pk) pk=a; } }
     peakHold = Math.max(pk, peakHold*0.95);
     g.clearRect(0,0,cv.width,cv.height);
     g.fillStyle = getComputedStyle(document.documentElement).getPropertyValue("--line");
@@ -324,6 +342,19 @@ async function startRec(){
   $("rec").classList.add("on"); $("recLabel").textContent = "Stopp";
   setMsg("Aufnahme läuft – Satz vorlesen, dann Stopp.", "");
   lockNav(true);
+  // Watchdog: if no audio arrives, the microphone is dead (e.g. after the app was in the background)
+  const started = recStart;
+  setTimeout(() => {
+    if(recording && recStart === started && chunkLen === 0){
+      abortRec("Mikrofon liefert keine Daten – wurde neu gestartet. Bitte nochmal auf Aufnehmen tippen.");
+      teardownAudio();
+    }
+  }, 1200);
+}
+function abortRec(text){
+  recording = false; chunks = []; chunkLen = 0;
+  $("rec").classList.remove("on"); $("recLabel").textContent = "Aufnehmen";
+  lockNav(false); setMsg(text, "bad");
 }
 async function stopRec(){
   recording = false;
@@ -334,6 +365,10 @@ async function stopRec(){
   chunks = []; chunkLen = 0;
   lockNav(false);
   const p = prompts[idx];
+  if(!total.length || !ctx){
+    setMsg("Keine Audiodaten empfangen – Mikrofon wurde neu gestartet. Bitte nochmal aufnehmen.", "bad");
+    teardownAudio(); return;
+  }
   try{
     const res = processRecording(await resample(total, ctx.sampleRate));
     if(res.error){ setMsg(res.error, "bad"); return; }
@@ -490,6 +525,15 @@ $("wipe").onclick = async () => {
   if(!confirm("Wirklich ALLE Aufnahmen auf diesem Gerät löschen? Das kann nicht rückgängig gemacht werden.")) return;
   await dbClear(); meta = new Map(); render(); $("setMsg").textContent = "Alle Aufnahmen gelöscht.";
 };
+// Release the microphone when the page goes to the background (iOS/Android cut it off anyway)
+document.addEventListener("visibilitychange", () => {
+  if(document.visibilityState === "hidden"){
+    if(recording) abortRec("Aufnahme abgebrochen, weil die Seite verlassen wurde – bitte nochmal aufnehmen.");
+    teardownAudio();
+  }
+});
+window.addEventListener("pagehide", () => { if(recording) abortRec("Aufnahme abgebrochen."); teardownAudio(); });
+
 document.addEventListener("keydown", e => {
   if(e.target.matches("input,select,textarea")) return;
   if(e.code==="Space"){ e.preventDefault(); $("rec").click(); }
